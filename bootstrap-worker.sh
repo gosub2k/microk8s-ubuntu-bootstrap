@@ -2,7 +2,12 @@
 set -euo pipefail
 
 # Bootstrap a MicroK8s worker node from the control plane
-# Usage: ./bootstrap-worker.sh <worker-ip> [ssh-user]
+# Usage: ./bootstrap-worker.sh <worker-host> [ssh-user]
+#
+# <worker-host> may be an IP or a hostname (e.g. an /etc/hosts alias that
+# points at a specific NIC on a multi-homed box, like "myhost-wired" vs
+# "myhost"). The node registers in the cluster under exactly this name, and
+# flannel is pinned to advertise the IP that this name resolves to.
 #
 # Runs on the control plane node. SSHes to the worker to install
 # snap/microk8s, joins it to the cluster, configures flannel CIDR
@@ -13,7 +18,7 @@ if [ -f "${HOME}/.ssh/agent-env" ]; then
     source "${HOME}/.ssh/agent-env"
 fi
 
-WORKER_IP="${1:?Usage: $0 <worker-ip> [ssh-user]}"
+WORKER_IP="${1:?Usage: $0 <worker-host> [ssh-user]}"
 SSH_USER="${2:-$(whoami)}"
 MICROK8S_CHANNEL="latest/stable"
 CIDR_PREFIX="10.69"
@@ -168,6 +173,30 @@ ssh_worker "sudo rm -f /var/snap/microk8s/current/args/cni-network/10-calico.con
 # Add SSH user to microk8s group
 ssh_worker "sudo usermod -aG microk8s ${SSH_USER} 2>/dev/null || true"
 
+# --- Resolve which IP/interface we're actually talking to ---
+# WORKER_IP may be a plain IP or a hostname (e.g. an /etc/hosts alias like
+# "myhost-wired" that points at a specific NIC on a multi-homed box). The node
+# should register in the cluster under exactly the name given on the command
+# line, and flannel should advertise the IP of that specific NIC — not
+# whatever the worker's own `hostname` command or default route reports.
+WORKER_HOSTNAME="${WORKER_IP}"
+
+log "Resolving ${WORKER_IP} to an IP address..."
+RESOLVED_IP=$(getent ahostsv4 "${WORKER_IP}" 2>/dev/null | awk '{print $1; exit}')
+if [ -z "${RESOLVED_IP}" ]; then
+    RESOLVED_IP="${WORKER_IP}"
+fi
+log "Resolved IP: ${RESOLVED_IP}"
+
+log "Determining which NIC on the worker carries ${RESOLVED_IP}..."
+WORKER_IP_OUTPUT=$(ssh_worker "ip -4 -o addr show")
+WORKER_IFACE=$(echo "${WORKER_IP_OUTPUT}" | awk -v ip="${RESOLVED_IP}/" '$4 ~ "^"ip {print $2; exit}')
+if [ -n "${WORKER_IFACE}" ]; then
+    log "Worker interface for ${RESOLVED_IP}: ${WORKER_IFACE}"
+else
+    log "WARN: Could not determine which interface carries ${RESOLVED_IP}; flannel public-ip override will be skipped"
+fi
+
 # --- Leave any existing cluster before joining ---
 log "Checking if worker is already in a cluster..."
 # THIS IS BROKEN:
@@ -185,6 +214,21 @@ else
 fi
 
 if [ "${ALREADY_JOINED}" = false ]; then
+    # --- Force kubelet to register under the provided hostname, not its own ---
+    log "Configuring kubelet to register as '${WORKER_HOSTNAME}'..."
+    ssh_worker "sudo bash -s" <<HOSTNAME_EOF
+set -euo pipefail
+KUBELET_ARGS="/var/snap/microk8s/current/args/kubelet"
+if grep -q '^--hostname-override=' "\${KUBELET_ARGS}" 2>/dev/null; then
+    sed -i "s|^--hostname-override=.*|--hostname-override=${WORKER_HOSTNAME}|" "\${KUBELET_ARGS}"
+else
+    echo "--hostname-override=${WORKER_HOSTNAME}" >> "\${KUBELET_ARGS}"
+fi
+HOSTNAME_EOF
+    log "Restarting microk8s on worker to apply hostname override..."
+    ssh_worker "sudo snap restart microk8s"
+    ssh_worker "sudo /snap/bin/microk8s status --wait-ready --timeout 120" >/dev/null
+
     # --- Generate join token and join worker ---
     log "Generating join token on control plane..."
     JOIN_URL=$(microk8s add-node --format short 2>/dev/null | head -1 | awk '{print $NF}')
@@ -198,8 +242,7 @@ if [ "${ALREADY_JOINED}" = false ]; then
 fi
 
 # --- Wait for node to appear ---
-log "Waiting for worker node to appear in cluster..."
-WORKER_HOSTNAME=$(ssh_worker "hostname")
+log "Waiting for worker node to appear in cluster as '${WORKER_HOSTNAME}'..."
 for i in $(seq 1 30); do
     if microk8s kubectl get node "${WORKER_HOSTNAME}" &>/dev/null; then
         break
@@ -207,6 +250,14 @@ for i in $(seq 1 30); do
     sleep 2
 done
 microk8s kubectl get node "${WORKER_HOSTNAME}" &>/dev/null || err "Worker node ${WORKER_HOSTNAME} did not appear in cluster"
+
+# --- Pin flannel's advertised public IP to the resolved NIC ---
+# Without this, flannel picks the default-route interface, which may not be
+# the NIC ${WORKER_HOSTNAME} actually refers to on a multi-homed worker.
+if [ -n "${WORKER_IFACE}" ]; then
+    log "Setting flannel public-ip override to ${RESOLVED_IP} (${WORKER_IFACE}) on node ${WORKER_HOSTNAME}..."
+    microk8s kubectl annotate node "${WORKER_HOSTNAME}" "flannel.alpha.coreos.com/public-ip=${RESOLVED_IP}" --overwrite
+fi
 
 # --- Configure flannel CIDR on the node ---
 log "Configuring flannel podCIDR ${NODE_CIDR} on node ${WORKER_HOSTNAME}..."
